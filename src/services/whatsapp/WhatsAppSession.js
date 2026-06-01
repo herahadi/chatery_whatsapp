@@ -191,7 +191,7 @@ class WhatsAppSession {
                 version,
                 auth: state,
                 logger: pino({ level: 'silent' }),
-                browser: ['Chatery API', 'Chrome', '1.0.0'],
+                browser: ['GateWA API', 'Chrome', '1.0.0'],
                 syncFullHistory: true
             });
 
