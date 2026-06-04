@@ -1,4 +1,4 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getContentType } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getContentType, jidNormalizedUser } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
@@ -260,6 +260,15 @@ class WhatsAppSession {
                     this.phoneNumber = this.socket.user.id.split(':')[0];
                     this.name = this.socket.user.name || 'Unknown';
                     console.log(`👤 [${this.sessionId}] Connected as: ${this.name} (${this.phoneNumber})`);
+                    
+                    // Register me JID, LID, and Phone Number
+                    if (this.store) {
+                        const normalizedMe = jidNormalizedUser(this.socket.user.id);
+                        const meLid = this.socket.user.lid;
+                        if (meLid) {
+                            this.store.registerIdentity(meLid, normalizedMe, this.phoneNumber);
+                        }
+                    }
                 }
                 
                 // Emit connection status to WebSocket
@@ -309,14 +318,14 @@ class WhatsAppSession {
                     await this._autoSaveMedia(message);
                     
                     // Emit message to WebSocket
-                    const formattedMessage = MessageFormatter.formatMessage(message);
+                    const formattedMessage = MessageFormatter.formatMessage(message, this.store);
                     wsManager.emitMessage(this.sessionId, formattedMessage);
                     
                     // Send webhook
                     this._sendWebhook('message', formattedMessage);
                 } else if (message.key.fromMe && m.type === 'notify') {
                     // Message sent confirmation
-                    const formattedMessage = MessageFormatter.formatMessage(message);
+                    const formattedMessage = MessageFormatter.formatMessage(message, this.store);
                     wsManager.emitMessageSent(this.sessionId, formattedMessage);
                     
                     // Send webhook
@@ -611,6 +620,43 @@ class WhatsAppSession {
 
     isGroupId(chatId) {
         return chatId.includes('@g.us');
+    }
+
+    async resolveLidFromServer(lid) {
+        if (!lid || !lid.endsWith('@lid') || !this.socket) return null;
+        
+        try {
+            const { USyncQuery, USyncUser } = require('@whiskeysockets/baileys');
+            const query = new USyncQuery()
+                .withContext('message')
+                .withDeviceProtocol()
+                .withLIDProtocol();
+                
+            query.withUser(new USyncUser().withId(lid));
+            
+            const result = await this.socket.executeUSyncQuery(query);
+            if (result && result.list) {
+                for (const item of result.list) {
+                    if (item.lid && item.id) {
+                        const lidJid = item.lid.toLowerCase();
+                        const pnJid = item.id.toLowerCase();
+                        if (this.store) {
+                            this.store.registerIdentity(lidJid, pnJid);
+                        }
+                        if (lidJid === lid.toLowerCase()) {
+                            return {
+                                lid: lidJid,
+                                jid: pnJid,
+                                pn: pnJid.split('@')[0]
+                            };
+                        }
+                    }
+                }
+            }
+        } catch (error) {
+            console.error(`[${this.sessionId}] Error resolving LID from server:`, error.message);
+        }
+        return null;
     }
 
     // ==================== SEND MESSAGES ====================
@@ -1252,6 +1298,183 @@ class WhatsAppSession {
         }
     }
 
+    // ==================== LABELS ====================
+
+    /**
+     * Get all labels
+     */
+    async getLabels() {
+        try {
+            if (!this.socket || this.connectionStatus !== 'connected') {
+                return { success: false, message: 'Session not connected' };
+            }
+            if (!this.store) {
+                return { success: false, message: 'Store not initialized' };
+            }
+
+            const labels = this.store.getLabels();
+            return {
+                success: true,
+                data: { labels, total: labels.length }
+            };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
+    /**
+     * Get label by ID
+     */
+    async getLabelById(labelId) {
+        try {
+            if (!this.store) {
+                return { success: false, message: 'Store not initialized' };
+            }
+
+            const label = this.store.getLabelById(labelId);
+            if (!label) {
+                return { success: false, message: 'Label not found' };
+            }
+            return { success: true, data: label };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
+    /**
+     * Add label to chat
+     */
+    async addChatLabel(chatId, labelId) {
+        try {
+            if (!this.socket || this.connectionStatus !== 'connected') {
+                return { success: false, message: 'Session not connected' };
+            }
+
+            const jid = this.formatChatId(chatId);
+            await this.socket.addChatLabel(jid, labelId);
+
+            // Update store immediately
+            if (this.store) {
+                this.store.addLabelAssociation(jid, labelId);
+            }
+
+            return { success: true, message: 'Label added to chat', data: { chatId: jid, labelId } };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
+    /**
+     * Remove label from chat
+     */
+    async removeChatLabel(chatId, labelId) {
+        try {
+            if (!this.socket || this.connectionStatus !== 'connected') {
+                return { success: false, message: 'Session not connected' };
+            }
+
+            const jid = this.formatChatId(chatId);
+            await this.socket.removeChatLabel(jid, labelId);
+
+            // Update store immediately
+            if (this.store) {
+                this.store.removeLabelAssociation(jid, labelId);
+            }
+
+            return { success: true, message: 'Label removed from chat', data: { chatId: jid, labelId } };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
+    /**
+     * Add label to a specific message
+     */
+    async addMessageLabel(chatId, messageId, labelId) {
+        try {
+            if (!this.socket || this.connectionStatus !== 'connected') {
+                return { success: false, message: 'Session not connected' };
+            }
+
+            const jid = this.formatChatId(chatId);
+
+            if (typeof this.socket.addMessageLabel !== 'function') {
+                return { success: false, message: 'Message labeling not supported in this Baileys version' };
+            }
+
+            await this.socket.addMessageLabel(jid, messageId, labelId);
+            return { success: true, message: 'Label added to message', data: { chatId: jid, messageId, labelId } };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
+    /**
+     * Remove label from a specific message
+     */
+    async removeMessageLabel(chatId, messageId, labelId) {
+        try {
+            if (!this.socket || this.connectionStatus !== 'connected') {
+                return { success: false, message: 'Session not connected' };
+            }
+
+            const jid = this.formatChatId(chatId);
+
+            if (typeof this.socket.removeMessageLabel !== 'function') {
+                return { success: false, message: 'Message labeling not supported in this Baileys version' };
+            }
+
+            await this.socket.removeMessageLabel(jid, messageId, labelId);
+            return { success: true, message: 'Label removed from message', data: { chatId: jid, messageId, labelId } };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
+    /**
+     * Get all chats with a specific label
+     */
+    async getChatsByLabel(labelId) {
+        try {
+            if (!this.store) {
+                return { success: false, message: 'Store not initialized' };
+            }
+
+            const label = this.store.getLabelById(labelId);
+            if (!label) {
+                return { success: false, message: 'Label not found' };
+            }
+
+            const chats = this.store.getChatsByLabel(labelId);
+            return {
+                success: true,
+                data: { label, chats, total: chats.length }
+            };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
+    /**
+     * Get all labels for a specific chat
+     */
+    async getLabelsByChat(chatId) {
+        try {
+            if (!this.store) {
+                return { success: false, message: 'Store not initialized' };
+            }
+
+            const jid = this.formatChatId(chatId);
+            const labels = this.store.getLabelsByChat(jid);
+            return {
+                success: true,
+                data: { chatId: jid, labels, total: labels.length }
+            };
+        } catch (error) {
+            return { success: false, message: error.message };
+        }
+    }
+
     // ==================== CHAT HISTORY ====================
 
     /**
@@ -1267,7 +1490,7 @@ class WhatsAppSession {
                 return { success: false, message: 'Store not initialized' };
             }
 
-            // Use fast method from BaileysStore
+            // Get pre-sorted overview from cache (fast O(1) lookup + slice)
             const result = this.store.getChatsOverviewFast({ limit: 1000, offset: 0 });
             let chats = result.data;
 
@@ -1278,37 +1501,46 @@ class WhatsAppSession {
                 chats = chats.filter(c => !c.isGroup);
             }
 
-            // Fetch missing profile pictures in parallel (batch)
-            const chatsNeedingPics = chats.filter(c => !c.profilePicture).slice(0, 20);
-            if (chatsNeedingPics.length > 0) {
-                const picPromises = chatsNeedingPics.map(async (chat) => {
-                    try {
-                        const url = await this.socket.profilePictureUrl(chat.id, 'image');
-                        this.store.setProfilePicture(chat.id, url);
-                        chat.profilePicture = url;
-                    } catch (e) {
-                        // No profile picture available
-                    }
-                });
-                await Promise.all(picPromises);
-            }
-
             // Apply pagination
             const total = chats.length;
             const paginatedChats = chats.slice(offset, offset + limit);
 
-            // Transform to expected format
-            const formattedChats = paginatedChats.map(chat => ({
-                id: chat.id,
-                name: chat.name,
-                phone: chat.isGroup ? null : chat.id.split('@')[0],
-                isGroup: chat.isGroup,
-                profilePicture: chat.profilePicture,
-                participantsCount: null,
-                lastMessage: chat.lastMessage?.preview || null,
-                lastMessageTimestamp: chat.lastMessage?.timestamp || chat.conversationTimestamp || 0,
-                unreadCount: chat.unreadCount || 0
-            }));
+            // Transform to expected format (pure in-memory, no network calls)
+            const formattedChats = paginatedChats.map(chat => {
+                let resolvedId = chat.id;
+                let resolvedPhone = chat.isGroup ? null : chat.id.split('@')[0];
+                let resolvedName = chat.name;
+
+                if (!chat.isGroup && this.store) {
+                    const resolved = this.store.resolveIdentity(chat.id);
+                    if (resolved) {
+                        resolvedId = resolved.jid || resolvedId;
+                        resolvedPhone = resolved.pn || resolvedPhone;
+                    }
+
+                    // Fix name if it's still LID-based
+                    const lidNumber = chat.id.endsWith('@lid') ? chat.id.split('@')[0] : null;
+                    if (resolvedName && (resolvedName.endsWith('@lid') || resolvedName === lidNumber)) {
+                        const contact = this.store.getContact(resolvedId);
+                        resolvedName = contact?.name || contact?.notify || resolvedPhone || resolvedId.split('@')[0];
+                    }
+                }
+
+                return {
+                    id: resolvedId,
+                    name: resolvedName,
+                    phone: resolvedPhone,
+                    isGroup: chat.isGroup,
+                    profilePicture: chat.profilePicture,
+                    participantsCount: null,
+                    lastMessage: chat.lastMessage?.preview || null,
+                    lastMessageTimestamp: chat.lastMessage?.timestamp || chat.conversationTimestamp || 0,
+                    unreadCount: chat.unreadCount || 0
+                };
+            });
+
+            // Fetch missing profile pictures in background (non-blocking)
+            this._fetchMissingProfilePictures(paginatedChats);
 
             return {
                 success: true,
@@ -1326,9 +1558,28 @@ class WhatsAppSession {
     }
 
     /**
+     * Fetch missing profile pictures in background (fire-and-forget, non-blocking)
+     */
+    _fetchMissingProfilePictures(items) {
+        if (!this.socket || !this.store) return;
+        const needPics = items.filter(c => !c.profilePicture).slice(0, 10);
+        if (needPics.length === 0) return;
+
+        // Fire and forget — don't await
+        Promise.all(needPics.map(async (item) => {
+            try {
+                const url = await this.socket.profilePictureUrl(item.id, 'image');
+                this.store.setProfilePicture(item.id, url);
+            } catch (e) {
+                // No profile picture available
+            }
+        })).catch(() => {});
+    }
+
+    /**
      * Get contacts list - OPTIMIZED VERSION using cache
      */
-    async getContacts(limit = 100, offset = 0, search = '') {
+    async getContacts(limit = 50, offset = 0, search = '') {
         try {
             if (!this.socket || this.connectionStatus !== 'connected') {
                 return { success: false, message: 'Session not connected' };
@@ -1346,21 +1597,6 @@ class WhatsAppSession {
             const total = contacts.length;
             const paginatedContacts = contacts.slice(offset, offset + limit);
 
-            // Fetch missing profile pictures in parallel (batch of 20 max)
-            const contactsNeedingPics = paginatedContacts.filter(c => !c.profilePicture).slice(0, 20);
-            if (contactsNeedingPics.length > 0) {
-                const picPromises = contactsNeedingPics.map(async (contact) => {
-                    try {
-                        const url = await this.socket.profilePictureUrl(contact.id, 'image');
-                        this.store.setProfilePicture(contact.id, url);
-                        contact.profilePicture = url;
-                    } catch (e) {
-                        // No profile picture available
-                    }
-                });
-                await Promise.all(picPromises);
-            }
-
             // Transform to expected format
             const formattedContacts = paginatedContacts.map(c => ({
                 id: c.id,
@@ -1370,6 +1606,9 @@ class WhatsAppSession {
                 pushName: c.notify || null,
                 profilePicture: c.profilePicture
             }));
+
+            // Fetch missing profile pictures in background (non-blocking)
+            this._fetchMissingProfilePictures(paginatedContacts);
 
             return {
                 success: true,
@@ -1393,6 +1632,12 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
+            
+            // Resolve unmapped LID from server
+            if (jid && jid.endsWith('@lid') && this.store && !this.store.resolveIdentity(jid)) {
+                await this.resolveLidFromServer(jid);
+            }
+
             const isGroup = this.isGroupId(jid);
             
             let messages = [];
@@ -1431,7 +1676,7 @@ class WhatsAppSession {
 
             const formattedMessages = messages
                 .filter(msg => msg && msg.key) // Filter invalid messages
-                .map(msg => MessageFormatter.formatMessage(msg))
+                .map(msg => MessageFormatter.formatMessage(msg, this.store))
                 .filter(msg => msg !== null);
 
             return {
@@ -1460,6 +1705,12 @@ class WhatsAppSession {
             }
 
             const jid = this.formatChatId(chatId);
+            
+            // Resolve unmapped LID from server
+            if (jid && jid.endsWith('@lid') && this.store && !this.store.resolveIdentity(jid)) {
+                await this.resolveLidFromServer(jid);
+            }
+
             const isGroup = this.isGroupId(jid);
             
             let profilePicture = null;
@@ -1481,12 +1732,23 @@ class WhatsAppSession {
                             ownerPhone: metadata.owner?.split('@')[0],
                             creation: metadata.creation,
                             description: metadata.desc || null,
-                            participants: metadata.participants.map(p => ({
-                                id: p.id,
-                                phone: p.id.split('@')[0],
-                                isAdmin: p.admin === 'admin' || p.admin === 'superadmin',
-                                isSuperAdmin: p.admin === 'superadmin'
-                            })),
+                            participants: metadata.participants.map(p => {
+                                let resolvedId = p.id;
+                                let resolvedPhone = p.id.split('@')[0];
+                                if (this.store) {
+                                    const resolved = this.store.resolveIdentity(p.id);
+                                    if (resolved) {
+                                        resolvedId = resolved.jid || resolvedId;
+                                        resolvedPhone = resolved.pn || resolvedPhone;
+                                    }
+                                }
+                                return {
+                                    id: resolvedId,
+                                    phone: resolvedPhone,
+                                    isAdmin: p.admin === 'admin' || p.admin === 'superadmin',
+                                    isSuperAdmin: p.admin === 'superadmin'
+                                };
+                            }),
                             participantsCount: metadata.participants.length
                         }
                     };
@@ -1494,7 +1756,15 @@ class WhatsAppSession {
                     return { success: false, message: 'Failed to get group info' };
                 }
             } else {
-                const phone = jid.split('@')[0];
+                let resolvedJid = jid;
+                let phone = jid.split('@')[0];
+                if (this.store) {
+                    const resolved = this.store.resolveIdentity(jid);
+                    if (resolved) {
+                        resolvedJid = resolved.jid || resolvedJid;
+                        phone = resolved.pn || phone;
+                    }
+                }
                 
                 let status = null;
                 try {
@@ -1511,7 +1781,7 @@ class WhatsAppSession {
                 return {
                     success: true,
                     data: {
-                        id: jid,
+                        id: resolvedJid,
                         phone: phone,
                         isGroup: false,
                         profilePicture: profilePicture,
@@ -1656,6 +1926,17 @@ class WhatsAppSession {
             console.error(`[${this.sessionId}] Auto-save media error:`, error.message);
             return null;
         }
+    }
+
+    _getMimetype(contentType) {
+        const map = {
+            'imageMessage': 'image/jpeg',
+            'videoMessage': 'video/mp4',
+            'audioMessage': 'audio/ogg; codecs=opus',
+            'documentMessage': 'application/octet-stream',
+            'stickerMessage': 'image/webp'
+        };
+        return map[contentType] || 'application/octet-stream';
     }
 
     _getExtFromMimetype(mimetype) {

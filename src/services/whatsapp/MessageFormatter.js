@@ -8,8 +8,29 @@ class MessageFormatter {
      * @param {Object} msg - Raw message object dari Baileys
      * @returns {Object|null}
      */
-    static formatMessage(msg) {
+    static formatMessage(msg, store = null) {
         if (!msg || !msg.message) return null;
+
+        let resolvedChatId = msg.key.remoteJid;
+        let resolvedSender = msg.key.participant || msg.key.remoteJid;
+
+        if (store) {
+            // Resolve direct chat JID if it is an LID
+            if (resolvedChatId && resolvedChatId.endsWith('@lid')) {
+                const identity = store.resolveIdentity(resolvedChatId);
+                if (identity && identity.jid) {
+                    resolvedChatId = identity.jid;
+                }
+            }
+            
+            // Resolve sender JID if it is an LID
+            if (resolvedSender && resolvedSender.endsWith('@lid')) {
+                const identity = store.resolveIdentity(resolvedSender);
+                if (identity && identity.jid) {
+                    resolvedSender = identity.jid;
+                }
+            }
+        }
 
         const messageContent = msg.message;
         let type = 'unknown';
@@ -94,10 +115,10 @@ class MessageFormatter {
 
         return {
             id: msg.key.id,
-            chatId: msg.key.remoteJid,
+            chatId: resolvedChatId,
             fromMe: msg.key.fromMe || false,
-            sender: msg.key.participant || msg.key.remoteJid,
-            senderPhone: (msg.key.participant || msg.key.remoteJid)?.split('@')[0],
+            sender: resolvedSender,
+            senderPhone: resolvedSender?.split('@')[0],
             senderName: msg.pushName || null,
             timestamp: typeof msg.messageTimestamp === 'object' 
                 ? msg.messageTimestamp.low 
@@ -111,7 +132,7 @@ class MessageFormatter {
             isGroup: msg.key.remoteJid?.includes('@g.us') || false,
             quotedMessage: msg.message?.extendedTextMessage?.contextInfo?.quotedMessage ? {
                 id: msg.message.extendedTextMessage.contextInfo.stanzaId,
-                sender: msg.message.extendedTextMessage.contextInfo.participant
+                sender: store ? (store.resolveIdentity(msg.message.extendedTextMessage.contextInfo.participant)?.jid || msg.message.extendedTextMessage.contextInfo.participant) : msg.message.extendedTextMessage.contextInfo.participant
             } : null
         };
     }
